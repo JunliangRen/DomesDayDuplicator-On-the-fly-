@@ -66,6 +66,14 @@ public:
     explicit MainWindow(const ILogger& log, QWidget *parent = nullptr);
     ~MainWindow();
 
+private:
+    enum class RtlSdrDeviceStatus
+    {
+        notPresent,
+        present,
+        detectionFailed
+    };
+
 private slots:
     void configurationChangedSignalHandler();
     void remoteControlCommandSignalHandler(PlayerRemoteDialog::RemoteButtons button);
@@ -135,6 +143,7 @@ private:
     std::unique_ptr<Configuration> configuration;
     std::unique_ptr<UsbDeviceBase> usbDevice;
     std::unique_ptr<QLabel> usbStatusLabel;
+    std::unique_ptr<QLabel> rtlSdrStatusLabel;
     std::unique_ptr<QStorageInfo> storageInfo;
 
     std::unique_ptr<Ui::MainWindow> ui;
@@ -185,6 +194,11 @@ private:
     bool isPlayerConnected = false;
     bool usbDevicePresentLastCheck = false;
     bool isPlayerConnectedLastCheck = false;
+    bool rtlSdrEnabledLastCheck = false;
+    bool rtlSdrDeviceCheckHasRun = false;
+    RtlSdrDeviceStatus rtlSdrDeviceStatusCached = RtlSdrDeviceStatus::notPresent;
+    RtlSdrDeviceStatus rtlSdrDeviceStatusLastCheck = RtlSdrDeviceStatus::notPresent;
+    std::chrono::time_point<std::chrono::steady_clock> rtlSdrLastDeviceCheck;
     std::atomic<PlayerCommunication::DiscType> playerDiscTypeCached = PlayerCommunication::DiscType::unknownDiscType;
     std::atomic<qint32> minPlayerTimeCode = -1;
     std::atomic<qint32> maxPlayerTimeCode = -1;
@@ -210,6 +224,7 @@ private:
     void startPlayerControl();
     void updatePlayerRemoteDialog();
     void updateAmplitudeUI();
+    RtlSdrDeviceStatus updateRtlSdrDeviceStatusCache(bool forceCheck);
     void applyTheme();
     bool isSystemDarkTheme();
 

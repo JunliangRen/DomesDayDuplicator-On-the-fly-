@@ -55,6 +55,53 @@
 #include <QPalette>
 #include <QStyleFactory>
 
+namespace
+{
+constexpr auto rtlSdrDevicePollInterval = std::chrono::seconds{5};
+
+struct LibUsbContextDeleter
+{
+    void operator()(libusb_context* context) const
+    {
+        if (context != nullptr)
+        {
+            libusb_exit(context);
+        }
+    }
+};
+
+struct LibUsbDeviceListDeleter
+{
+    void operator()(libusb_device** devices) const
+    {
+        if (devices != nullptr)
+        {
+            libusb_free_device_list(devices, 1);
+        }
+    }
+};
+
+bool isKnownRtlSdrUsbDevice(uint16_t vendorId, uint16_t productId)
+{
+    if (vendorId != 0x0bda)
+    {
+        return false;
+    }
+
+    // Supported Realtek RTL283x USB IDs used by common RTL-SDR dongles, including RTL-SDR Blog devices.
+    switch (productId)
+    {
+    case 0x2830:
+    case 0x2831:
+    case 0x2832:
+    case 0x2838:
+        return true;
+    default:
+        return false;
+    }
+}
+}
+
 MainWindow::MainWindow(const ILogger& log, QWidget* parent) :
     QMainWindow(parent),
     log(log)
@@ -114,6 +161,10 @@ MainWindow::MainWindow(const ILogger& log, QWidget* parent) :
     usbStatusLabel.reset(new QLabel);
     ui->statusBar->addWidget(usbStatusLabel.get());
     usbStatusLabel->setText(tr("No USB capture device is attached"));
+
+    rtlSdrStatusLabel.reset(new QLabel);
+    ui->statusBar->addWidget(rtlSdrStatusLabel.get());
+    rtlSdrStatusLabel->setText(tr("RTL-SDR capture is disabled"));
 
     // Disable the capture button
     ui->capturePushButton->setEnabled(false);
@@ -889,11 +940,88 @@ void MainWindow::updateCaptureStatus()
     }
 }
 
+MainWindow::RtlSdrDeviceStatus MainWindow::updateRtlSdrDeviceStatusCache(bool forceCheck)
+{
+    auto now = std::chrono::steady_clock::now();
+    if (!forceCheck && rtlSdrDeviceCheckHasRun && (now - rtlSdrLastDeviceCheck < rtlSdrDevicePollInterval))
+    {
+        return rtlSdrDeviceStatusCached;
+    }
+
+    rtlSdrDeviceCheckHasRun = true;
+    rtlSdrLastDeviceCheck = now;
+
+    RtlSdrDeviceStatus rtlSdrDeviceStatus = RtlSdrDeviceStatus::notPresent;
+    libusb_context* libUsbContextRaw = nullptr;
+#if LIBUSB_API_VERSION >= 0x0100010A
+    int initReturn = libusb_init_context(&libUsbContextRaw, nullptr, 0);
+#else
+    int initReturn = libusb_init(&libUsbContextRaw);
+#endif
+    if (initReturn != 0)
+    {
+        log.Warning("MainWindow::updateRtlSdrDeviceStatusCache(): libusb init failed with error code {0}:{1}", initReturn, libusb_error_name(initReturn));
+        rtlSdrDeviceStatusCached = RtlSdrDeviceStatus::detectionFailed;
+        return rtlSdrDeviceStatusCached;
+    }
+    std::unique_ptr<libusb_context, LibUsbContextDeleter> libUsbContext(libUsbContextRaw);
+
+    libusb_device** usbDevicesRaw = nullptr;
+    ssize_t deviceCount = libusb_get_device_list(libUsbContext.get(), &usbDevicesRaw);
+    if (deviceCount < 0)
+    {
+        log.Warning("MainWindow::updateRtlSdrDeviceStatusCache(): libusb device enumeration failed with error code {0}:{1}", deviceCount, libusb_error_name((int)deviceCount));
+        rtlSdrDeviceStatusCached = RtlSdrDeviceStatus::detectionFailed;
+        return rtlSdrDeviceStatusCached;
+    }
+    std::unique_ptr<libusb_device*, LibUsbDeviceListDeleter> usbDevices(usbDevicesRaw);
+
+    bool descriptorReadFailed = false;
+    for (ssize_t deviceCounter = 0; deviceCounter < deviceCount; deviceCounter++)
+    {
+        libusb_device_descriptor deviceDescriptor;
+        int descriptorReturn = libusb_get_device_descriptor(usbDevices.get()[deviceCounter], &deviceDescriptor);
+        if (descriptorReturn != 0)
+        {
+            log.Warning("MainWindow::updateRtlSdrDeviceStatusCache(): libusb descriptor read failed with error code {0}:{1}", descriptorReturn, libusb_error_name(descriptorReturn));
+            descriptorReadFailed = true;
+            continue;
+        }
+
+        if (isKnownRtlSdrUsbDevice(deviceDescriptor.idVendor, deviceDescriptor.idProduct))
+        {
+            rtlSdrDeviceStatus = RtlSdrDeviceStatus::present;
+            break;
+        }
+    }
+
+    if ((rtlSdrDeviceStatus == RtlSdrDeviceStatus::notPresent) && descriptorReadFailed)
+    {
+        rtlSdrDeviceStatus = RtlSdrDeviceStatus::detectionFailed;
+    }
+
+    rtlSdrDeviceStatusCached = rtlSdrDeviceStatus;
+    return rtlSdrDeviceStatusCached;
+}
+
 void MainWindow::updateDeviceStatus()
 {
     // If the player and USB device present state hasn't changed, abort any further processing.
     bool usbDevicePresent = usbDevice->DevicePresent(configuration->getUsbPreferredDevice().toStdString());
-    if ((usbDevicePresentLastCheck == usbDevicePresent) && (isPlayerConnectedLastCheck == isPlayerConnected))
+    bool rtlSdrEnabled = configuration->getSdrEnabled();
+    RtlSdrDeviceStatus rtlSdrDeviceStatus = RtlSdrDeviceStatus::notPresent;
+    if (rtlSdrEnabled)
+    {
+        rtlSdrDeviceStatus = updateRtlSdrDeviceStatusCache(rtlSdrEnabledLastCheck != rtlSdrEnabled);
+    }
+    else
+    {
+        rtlSdrDeviceCheckHasRun = false;
+        rtlSdrDeviceStatusCached = RtlSdrDeviceStatus::notPresent;
+    }
+
+    if ((usbDevicePresentLastCheck == usbDevicePresent) && (isPlayerConnectedLastCheck == isPlayerConnected) &&
+        (rtlSdrEnabledLastCheck == rtlSdrEnabled) && (rtlSdrDeviceStatusLastCheck == rtlSdrDeviceStatus))
     {
         return;
     }
@@ -947,8 +1075,28 @@ void MainWindow::updateDeviceStatus()
         // Enable the test mode option
         ui->actionTest_mode->setEnabled(true);
     }
+
+    if (!rtlSdrEnabled)
+    {
+        rtlSdrStatusLabel->setText(tr("RTL-SDR capture is disabled"));
+    }
+    else if (rtlSdrDeviceStatus == RtlSdrDeviceStatus::present)
+    {
+        rtlSdrStatusLabel->setText(tr("Supported RTL-SDR device is connected"));
+    }
+    else if (rtlSdrDeviceStatus == RtlSdrDeviceStatus::detectionFailed)
+    {
+        rtlSdrStatusLabel->setText(tr("RTL-SDR detection failed"));
+    }
+    else
+    {
+        rtlSdrStatusLabel->setText(tr("No supported RTL-SDR device is attached"));
+    }
+
     usbDevicePresentLastCheck = usbDevicePresent;
     isPlayerConnectedLastCheck = isPlayerConnected;
+    rtlSdrEnabledLastCheck = rtlSdrEnabled;
+    rtlSdrDeviceStatusLastCheck = rtlSdrDeviceStatus;
 }
 
 // Update the player control labels
